@@ -1,0 +1,13 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'ru.uetmap.passenger.beta'
+    compileSdk 33
+    defaultConfig {
+        applicationId 'ru.uetmap.passenger.beta'
+        minSdk 24
+        targetSdk 33
+        versionCode 2
+        versionName '1.0.2-beta'
+    }
+}
