@@ -1,0 +1,183 @@
+name: Publish Android Release APK
+
+'on':
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build & Publish Release APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.5'
+
+      - name: Decode Release Keystore
+        id: decode_keystore
+        run: |
+          KEYSTORE_PATH="${RUNNER_TEMP}/release.keystore"
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "${KEYSTORE_PATH}"
+          if [ ! -s "${KEYSTORE_PATH}" ]; then
+            echo "FATAL: Failed to decode signing keystore from secret" >&2
+            exit 1
+          fi
+          echo "keystore_path=${KEYSTORE_PATH}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Release APK
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ steps.decode_keystore.outputs.keystore_path }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          gradle :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Clean Keystore from Runner Disk
+        if: always()
+        run: |
+          rm -f "${RUNNER_TEMP}/release.keystore"
+
+      - name: Verify APK & Package Metadata
+        id: verify_apk
+        run: |
+          BUILD_TOOLS_DIR=$(find "${ANDROID_HOME}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          echo "Using Android Build-Tools: ${BUILD_TOOLS_DIR}"
+          AAPT="${BUILD_TOOLS_DIR}/aapt"
+          APKSIGNER="${BUILD_TOOLS_DIR}/apksigner"
+
+          RAW_APK="app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "${RAW_APK}" ]; then
+            echo "FATAL: Built release APK not found at ${RAW_APK}" >&2
+            exit 1
+          fi
+
+          # 1. Package Badging Inspection
+          BADGING=$("${AAPT}" dump badging "${RAW_APK}")
+          
+          # Extract applicationId
+          APP_ID=$(echo "${BADGING}" | grep -oP "package: name='\K[^']+")
+          EXPECTED_APP_ID="ru.uetmap.passenger.beta"
+          echo "Application ID: ${APP_ID}"
+          if [ "${APP_ID}" != "${EXPECTED_APP_ID}" ]; then
+            echo "FATAL: applicationId mismatch! Expected '${EXPECTED_APP_ID}', got '${APP_ID}'" >&2
+            exit 1
+          fi
+
+          # Extract versionCode
+          VERSION_CODE=$(echo "${BADGING}" | grep -oP "versionCode='\K[^']+")
+          echo "versionCode: ${VERSION_CODE}"
+          if [ -z "${VERSION_CODE}" ] || [ "${VERSION_CODE}" -le 2 ]; then
+            echo "FATAL: versionCode (${VERSION_CODE}) must be strictly greater than 2 for new releases" >&2
+            exit 1
+          fi
+
+          # Extract versionName
+          VERSION_NAME=$(echo "${BADGING}" | grep -oP "versionName='\K[^']+")
+          echo "versionName: ${VERSION_NAME}"
+          
+          # 2. Tag alignment check
+          TAG_NAME="${GITHUB_REF_NAME}"
+          EXPECTED_TAG="v${VERSION_NAME}"
+          echo "Git Tag: ${TAG_NAME}"
+          if [ "${TAG_NAME}" != "${EXPECTED_TAG}" ]; then
+            echo "FATAL: Git tag '${TAG_NAME}' does not match expected tag '${EXPECTED_TAG}' for versionName '${VERSION_NAME}'" >&2
+            exit 1
+          fi
+
+          # 3. Cryptographic Signature Verification
+          echo "Verifying APK signature..."
+          "${APKSIGNER}" verify --verbose "${RAW_APK}"
+          
+          # Extract SHA-256 fingerprint
+          CERT_DIGESTS=$("${APKSIGNER}" verify --print-certs "${RAW_APK}")
+          ACTUAL_SHA256=$(echo "${CERT_DIGESTS}" | grep -i "Signer #1 certificate SHA-256 digest:" | awk '{print $NF}' | tr -d ' :' | tr '[:upper:]' '[:lower:]')
+          EXPECTED_SHA256="1a695d764ac94e0405021caa029a5b73bd80ffc1ff2666d49807176a30c6ac0d"
+
+          echo "Actual Certificate SHA-256:   ${ACTUAL_SHA256}"
+          echo "Expected Certificate SHA-256: ${EXPECTED_SHA256}"
+
+          if [ "${ACTUAL_SHA256}" != "${EXPECTED_SHA256}" ]; then
+            echo "FATAL: Certificate fingerprint mismatch! Halting release publication." >&2
+            exit 1
+          fi
+          echo "Certificate verification passed: EXACT MATCH"
+
+          # 4. Normalize file naming & compute APK hash
+          FINAL_APK_NAME="uetmap-passenger-${VERSION_NAME}.apk"
+          mv "${RAW_APK}" "${FINAL_APK_NAME}"
+
+          APK_SHA256=$(sha256sum "${FINAL_APK_NAME}" | awk '{print $1}')
+          echo "Release APK File: ${FINAL_APK_NAME}"
+          echo "Release APK SHA-256: ${APK_SHA256}"
+
+          # 5. Determine Prerelease Status
+          if echo "${TAG_NAME}" | grep -iE "(alpha|beta|rc)" > /dev/null; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "Prerelease: TRUE"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "Prerelease: FALSE"
+          fi
+
+          echo "apk_file=${FINAL_APK_NAME}" >> "$GITHUB_OUTPUT"
+          echo "apk_sha256=${APK_SHA256}" >> "$GITHUB_OUTPUT"
+          echo "version_name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+          APK_FILE: ${{ steps.verify_apk.outputs.apk_file }}
+          APK_SHA256: ${{ steps.verify_apk.outputs.apk_sha256 }}
+          VERSION_NAME: ${{ steps.verify_apk.outputs.version_name }}
+          VERSION_CODE: ${{ steps.verify_apk.outputs.version_code }}
+          IS_PRERELEASE: ${{ steps.verify_apk.outputs.is_prerelease }}
+        run: |
+          PRERELEASE_FLAG=""
+          if [ "${IS_PRERELEASE}" = "true" ]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          RELEASE_NOTES=$(cat <<EOF
+          ## UETMap Passenger App — ${TAG_NAME}
+
+          Официальный мобильный клиент для пассажиров городского электротранспорта города Ульяновска.
+
+          ### 📦 Информация о релизе
+          * **Файл:** \`${APK_FILE}\`
+          * **Версия (versionName):** \`${VERSION_NAME}\`
+          * **Код сборки (versionCode):** \`${VERSION_CODE}\`
+          * **Application ID:** \`ru.uetmap.passenger.beta\`
+          * **SHA-256 хэш APK:** \`${APK_SHA256}\`
+          * **Цифровой сертификат:** Подписано официальным верифицированным ключом UETMap (\`1A:69:5D:76...\`).
+
+          ### 📲 Обновление через Obtainium
+          Приложение поддерживает автоматические и полуавтоматические обновления через менеджер приложений [Obtainium](https://github.com/ImranR98/Obtainium):
+          1. Добавьте в Obtainium ссылку на репозиторий: \`https://github.com/gamedich/uetmap-passenger\`
+          2. Для beta-версий убедитесь, что включена опция **«Включать пре-релизы» (Include Prereleases)**.
+          EOF
+          )
+
+          gh release create "${TAG_NAME}" "${APK_FILE}" \
+            --title "UETMap Passenger ${TAG_NAME}" \
+            --notes "${RELEASE_NOTES}" \
+            ${PRERELEASE_FLAG}
