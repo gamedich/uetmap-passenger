@@ -4,6 +4,12 @@ name: Publish Android Release APK
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to build and publish (e.g. v1.0.3-beta)'
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -18,17 +24,59 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Validate Version Tag Syntax
+      - name: Determine Release Target
+        id: target
         run: |
-          TAG_NAME="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG_NAME="${{ inputs.release_tag }}"
+          else
+            TAG_NAME="${GITHUB_REF_NAME}"
+          fi
+          TAG_NAME=$(echo "${TAG_NAME}" | tr -d '[:space:]')
+          echo "Target Release Tag: ${TAG_NAME}"
+          if [ -z "${TAG_NAME}" ]; then
+            echo "FATAL: Release tag cannot be empty" >&2
+            exit 1
+          fi
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Version Tag & Checkout Source
+        id: validate_tag
+        run: |
+          TAG_NAME="${{ steps.target.outputs.tag_name }}"
           echo "Validating tag syntax: ${TAG_NAME}"
           TAG_REGEX='^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)(\.[0-9]+)?)?$'
           if [[ ! "${TAG_NAME}" =~ ${TAG_REGEX} ]]; then
             echo "FATAL: Tag '${TAG_NAME}' does not match required semver regex: ${TAG_REGEX}" >&2
             exit 1
           fi
-          echo "Tag syntax valid: ${TAG_NAME}"
+
+          # Verify that tag exists in remote origin and fetch it
+          git fetch origin "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
+          TAG_COMMIT=$(git rev-parse -q --verify "refs/tags/${TAG_NAME}^{commit}" || true)
+          if [ -z "${TAG_COMMIT}" ]; then
+            echo "FATAL: Tag '${TAG_NAME}' does not exist on origin or does not point to a commit" >&2
+            exit 1
+          fi
+          echo "Tag '${TAG_NAME}' resolves to commit: ${TAG_COMMIT}"
+
+          # For v1.0.3-beta, confirm exact expected target commit
+          if [ "${TAG_NAME}" = "v1.0.3-beta" ]; then
+            EXPECTED_COMMIT_PREFIX="d9ef2b4"
+            if [[ ! "${TAG_COMMIT}" =~ ^${EXPECTED_COMMIT_PREFIX} ]]; then
+              echo "FATAL: Target commit for v1.0.3-beta (${TAG_COMMIT}) does not match expected prefix ${EXPECTED_COMMIT_PREFIX}" >&2
+              exit 1
+            fi
+            echo "Commit verification for v1.0.3-beta: MATCHES ${EXPECTED_COMMIT_PREFIX}"
+          fi
+
+          # Checkout application source code at the immutable release tag commit
+          echo "Checking out repository at release tag ${TAG_NAME} (${TAG_COMMIT})..."
+          git checkout -f "${TAG_COMMIT}"
+          echo "Checked out commit: $(git rev-parse --short HEAD)"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -105,7 +153,7 @@ jobs:
           echo "versionName: ${VERSION_NAME}"
           
           # 2. Tag alignment check
-          TAG_NAME="${GITHUB_REF_NAME}"
+          TAG_NAME="${{ steps.target.outputs.tag_name }}"
           EXPECTED_TAG="v${VERSION_NAME}"
           echo "Git Tag: ${TAG_NAME}"
           if [ "${TAG_NAME}" != "${EXPECTED_TAG}" ]; then
@@ -183,7 +231,7 @@ jobs:
       - name: Publish GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ github.ref_name }}
+          TAG_NAME: ${{ steps.target.outputs.tag_name }}
           APK_FILE: ${{ steps.verify_apk.outputs.apk_file }}
           APK_SHA256: ${{ steps.verify_apk.outputs.apk_sha256 }}
           VERSION_NAME: ${{ steps.verify_apk.outputs.version_name }}
